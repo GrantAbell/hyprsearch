@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+search-preview: A Wayland-friendly GTK launcher that shows search suggestions
+on the left and a live web preview on the right. Enter opens the query in your
+default browser; Ctrl+Enter opens without closing the launcher. The divider is
+draggable, and the chosen split ratio is saved to a JSON config on drag end.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("WebKit2", "4.0")
+from gi.repository import Gdk, GLib, Gtk, WebKit2  # type: ignore
+
+
+# ========= defaults (overridable via config.json) =========
+CFG: Dict[str, Any] = {
+    "suggest_engine": "google",   # "google" | "ddg"
+    "preview_engine": "google",   # "google" | "ddg"
+    "open_engine":    "google",   # "google" | "ddg"
+    "debounce_ms": 120,
+    "preview_delay_ms": 140,
+    "width": 1200,
+    "height": 720,
+    "opacity": 0.92,
+    "title": "Search Preview",
+    "start_centered": True,
+    "enable_blur_hint": True,
+    "preview_ratio": 0.60,        # initial ratio (right preview share); updated on drag
+    "css_path": "~/.config/search-preview/style.css",
+    "min_list_width": 280         # prevents left pane cropping
+}
+
+CONFIG_PATH: str = os.path.expanduser("~/.config/search-preview/config.json")
+
+
+# ------------------------------- Config IO --------------------------------- #
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """
+    Atomically write a JSON file to disk.
+
+    Purpose
+    -------
+    Safely persists configuration to disk without risking a partially written
+    file (e.g., due to crashes or power loss). It writes to a temporary file
+    in the same directory and then atomically replaces the target.
+
+    Methodology
+    -----------
+    1) Ensure the target directory exists.
+    2) Create a temporary file alongside the target.
+    3) Dump the JSON payload with indentation and a trailing newline.
+    4) Atomically replace (rename) the temporary file to the final path.
+
+    Parameters
+    ----------
+    path : str
+        Absolute filesystem path where the JSON should be written.
+    data : Dict[str, Any]
+        Serializable dictionary to write as JSON.
+
+    Returns
+    -------
+    None
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".spcfg.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort cleanup on failure
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def save_config_value(key: str, value: Any) -> None:
+    """
+    Update one configuration key in the user's JSON config file.
+
+    Purpose
+    -------
+    Allows incremental updates to the user's configuration (e.g., saving the
+    preview/list ratio) without clobbering unrelated keys.
+
+    Methodology
+    -----------
+    - Load existing config if it exists (tolerate read/JSON errors).
+    - Update the specific key to the provided value.
+    - Write back atomically via `_atomic_write_json`.
+
+    Parameters
+    ----------
+    key : str
+        Configuration key to update (e.g., "preview_ratio").
+    value : Any
+        The value to set for the key. Must be JSON-serializable.
+
+    Returns
+    -------
+    None
+    """
+    out: Dict[str, Any] = {}
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                out = json.load(f)
+    except Exception:
+        out = {}
+    out[key] = value
+    _atomic_write_json(CONFIG_PATH, out)
+
+
+def load_config() -> None:
+    """
+    Load configuration from environment variables and JSON config file.
+
+    Purpose
+    -------
+    Initializes the global `CFG` dictionary by honoring:
+      1) Environment variable overrides (for quick testing / per-bind tweaks).
+      2) JSON config file at `~/.config/search-preview/config.json`.
+
+    Methodology
+    -----------
+    - Environment variables (if present) map to internal keys:
+        SUGGEST_ENGINE/SP_SUGGEST  -> suggest_engine
+        PREVIEW_ENGINE/SP_PREVIEW  -> preview_engine
+        OPEN_ENGINE/SP_OPEN        -> open_engine
+    - If the JSON file exists and parses, overlay known keys from the file.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+    """
+    for k in ("SUGGEST_ENGINE", "PREVIEW_ENGINE", "OPEN_ENGINE",
+              "SP_SUGGEST", "SP_PREVIEW", "SP_OPEN"):
+        v = os.getenv(k)
+        if v:
+            key_map = {
+                "SUGGEST_ENGINE": "suggest_engine",
+                "SP_SUGGEST": "suggest_engine",
+                "PREVIEW_ENGINE": "preview_engine",
+                "SP_PREVIEW": "preview_engine",
+                "OPEN_ENGINE": "open_engine",
+                "SP_OPEN": "open_engine",
+            }
+            CFG[key_map[k]] = v.lower()
+
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in CFG.keys():
+                if k in data:
+                    CFG[k] = data[k]
+    except Exception:
+        # Tolerate missing or malformed config gracefully.
+        pass
+
+
+load_config()
+
+SUGGEST_ENGINE: str = str(CFG["suggest_engine"])
+PREVIEW_ENGINE: str = str(CFG["preview_engine"])
+OPEN_ENGINE: str = str(CFG["open_engine"])
+DEBOUNCE_MS: int = int(CFG["debounce_ms"])
+PREVIEW_DELAY_MS: int = int(CFG["preview_delay_ms"])
+INITIAL_RATIO: float = max(0.1, min(0.9, float(CFG.get("preview_ratio", 0.60))))
+MIN_LIST_W: int = max(160, int(CFG.get("min_list_width", 280)))
+CSS_PATH_EXPANDED: str = os.path.expanduser(str(CFG.get("css_path", "")))
+
+
+# ---------------------------- Suggestion backends --------------------------- #
+def fetch_suggestions_google(q: str) -> List[str]:
+    """
+    Fetch Google autocomplete suggestions for a query.
+
+    Purpose
+    -------
+    Retrieve a list of candidate search completions from Google's public
+    suggestion endpoint (Firefox client profile), enabling instant suggestions
+    as the user types.
+
+    Methodology
+    -----------
+    - Issue an HTTP GET to:
+        https://suggestqueries.google.com/complete/search?client=firefox&q=<q>
+    - Parse the JSON, which returns a list where index 1 is the suggestions.
+
+    Parameters
+    ----------
+    q : str
+        The partial or full search query string.
+
+    Returns
+    -------
+    List[str]
+        A list of suggestion strings. Empty list on error or empty input.
+    """
+    url = "https://suggestqueries.google.com/complete/search?" + urllib.parse.urlencode(
+        {"client": "firefox", "q": q}
+    )
+    with urllib.request.urlopen(url, timeout=5) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return list(data[1])
+
+
+def fetch_suggestions_ddg(q: str) -> List[str]:
+    """
+    Fetch DuckDuckGo autocomplete suggestions for a query.
+
+    Purpose
+    -------
+    Retrieve candidate search completions from DuckDuckGo's suggestion API,
+    used when the user prefers DDG suggestions.
+
+    Methodology
+    -----------
+    - Issue an HTTP GET to:
+        https://duckduckgo.com/ac/?q=<q>
+    - Parse the JSON array of objects and extract the "phrase" field.
+
+    Parameters
+    ----------
+    q : str
+        The partial or full search query string.
+
+    Returns
+    -------
+    List[str]
+        A list of suggestion strings. Empty list on error or empty input.
+    """
+    url = "https://duckduckgo.com/ac/?" + urllib.parse.urlencode({"q": q})
+    with urllib.request.urlopen(url, timeout=5) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return [it.get("phrase", "") for it in data if "phrase" in it]
+
+
+def suggestions(q: str) -> List[str]:
+    """
+    Get suggestions for a query using the configured suggestion engine.
+
+    Purpose
+    -------
+    Abstraction over multiple backends (Google, DDG). Returns an empty list
+    for blank input or on transient network errors.
+
+    Methodology
+    -----------
+    - Fast path return [] for whitespace-only queries.
+    - Dispatch to `fetch_suggestions_google` or `fetch_suggestions_ddg`
+      based on `SUGGEST_ENGINE`.
+    - Catch and swallow exceptions to keep the UI responsive.
+
+    Parameters
+    ----------
+    q : str
+        The query to complete.
+
+    Returns
+    -------
+    List[str]
+        Suggestion list (possibly empty).
+    """
+    if not q.strip():
+        return []
+    try:
+        return fetch_suggestions_ddg(q) if SUGGEST_ENGINE == "ddg" else fetch_suggestions_google(q)
+    except Exception:
+        return []
+
+
+def search_url(engine: str, q: str) -> str:
+    """
+    Build a search results URL for an engine and query.
+
+    Purpose
+    -------
+    Centralizes URL construction so Enter and the live preview both use
+    consistent, configurable engines.
+
+    Methodology
+    -----------
+    - For DuckDuckGo, return standard `https://duckduckgo.com/?q=<q>`.
+    - For Google, add `hl=en&igu=1` to reduce redirect/policy thrash in
+      embedded contexts, then append the encoded query.
+
+    Parameters
+    ----------
+    engine : str
+        One of {"google", "ddg"} (case-insensitive).
+    q : str
+        Raw query string (will be URL-encoded).
+
+    Returns
+    -------
+    str
+        Absolute HTTPS URL to load.
+    """
+    if engine.lower() == "ddg":
+        return "https://duckduckgo.com/?q=" + urllib.parse.quote(q)
+    return "https://www.google.com/search?hl=en&igu=1&q=" + urllib.parse.quote(q)
+
+
+# --------------------------------- Helpers --------------------------------- #
+def is_dark_mode() -> bool:
+    """
+    Detect whether GTK prefers a dark theme.
+
+    Purpose
+    -------
+    Provides a lightweight signal for choosing placeholder/background colors
+    to better match the user's system theme.
+
+    Methodology
+    -----------
+    - Read `gtk-application-prefer-dark-theme` from `Gtk.Settings`.
+    - Tolerate missing properties and default to False.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    bool
+        True if dark mode is preferred, False otherwise.
+    """
+    try:
+        s = Gtk.Settings.get_default()
+        return bool(s.get_property("gtk-application-prefer-dark-theme"))
+    except Exception:
+        return False
+
+
+def placeholder_html(text: str, dark: bool) -> str:
+    """
+    Build a simple placeholder HTML page for the preview pane.
+
+    Purpose
+    -------
+    Provides a visually neutral page while suggestions are loading or when
+    there is no current preview.
+
+    Methodology
+    -----------
+    - Choose background/foreground colors based on `dark`.
+    - Escape `text` for safety and insert into a minimal HTML body.
+
+    Parameters
+    ----------
+    text : str
+        The message to display (e.g., "Start typing…").
+    dark : bool
+        Whether to use dark-mode colors.
+
+    Returns
+    -------
+    str
+        A complete HTML document string.
+    """
+    bg = "#0f1115" if dark else "#fafafa"
+    fg = "#c9d1d9" if dark else "#444"
+    return (
+        f"<html><body style='font-family:sans-serif;padding:2rem;background:{bg};color:{fg}'>"
+        f"{html.escape(text)}</body></html>"
+    )
+
+
+# --------------------------------- App ------------------------------------- #
+class App(Gtk.Window):
+    """
+    Main application window containing:
+      - Left pane: Entry + suggestion list.
+      - Right pane: Live WebKit preview (Google/DDG results).
+      - Draggable divider; saved split ratio on drag end.
+
+    Lifecycle
+    ---------
+    - On init: build UI, apply CSS, set initial paned position (once).
+    - On type: debounce, fetch suggestions, repopulate list.
+    - On select: debounce, load preview URL into WebKit.
+    - On Enter: open default browser, optionally keep app open on Ctrl+Enter.
+    - On divider release: persist the preview/list ratio to JSON config.
+    """
+
+    def __init__(self, initial_query: str = "") -> None:
+        """
+        Construct and initialize the main window.
+
+        Parameters
+        ----------
+        initial_query : str, optional
+            If provided, pre-fills the search entry and immediately triggers
+            suggestions/preview for the text.
+        """
+        Gtk.Window.__init__(self, title=str(CFG["title"]))
+        self.set_default_size(int(CFG["width"]), int(CFG["height"]))
+        if bool(CFG["start_centered"]):
+            self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_border_width(8)
+
+        # Launcher-ish window hints
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_keep_above(True)
+
+        # Request RGBA visual so compositor blur/opacity can show through
+        try:
+            screen = Gdk.Screen.get_default()
+            visual = screen.get_rgba_visual()
+            if visual: 
+                self.set_visual(visual)
+                self.set_app_paintable(True)
+        except Exception:
+            pass
+
+        # === Paned layout (user-resizable) ===
+        self.paned: Gtk.Paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.paned.set_wide_handle(True)  # sizeable grip
+        # Track mouse button release to save ratio after user drags
+        self.paned.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.paned.connect("button-release-event", self._on_paned_button_release)
+        self.add(self.paned)
+
+        # ----- Left column (entry + list) -----
+        left_wrap: Gtk.Box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left_wrap.set_name("left-pane")
+        self.paned.add1(left_wrap)
+
+        self.entry: Gtk.Entry = Gtk.Entry()
+        self.entry.set_placeholder_text(
+            "Type to search…  (Enter opens, Ctrl+Enter opens & stays, Esc closes)"
+        )
+        if initial_query:
+            self.entry.set_text(initial_query)
+            self.entry.set_position(-1)
+        left_wrap.pack_start(self.entry, False, False, 0)
+
+        self.listbox: Gtk.ListBox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        scroller: Gtk.ScrolledWindow = Gtk.ScrolledWindow()
+        scroller.add(self.listbox)
+        scroller.set_min_content_width(MIN_LIST_W)  # avoid cropping on narrow windows
+        left_wrap.pack_start(scroller, True, True, 0)
+
+        # ----- Right preview -----
+        right_wrap: Gtk.Box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.paned.add2(right_wrap)
+
+        self.webview: WebKit2.WebView = WebKit2.WebView()
+
+        # Keep media light and avoid auto-playing audio
+        settings = self.webview.get_settings()
+        for prop, val in (
+            ("enable-webaudio", False),
+            ("enable-mediasource", False),
+            ("media-playback-requires-user-gesture", True),
+        ):
+            try:
+                settings.set_property(prop, val)
+            except Exception:
+                pass
+        try:
+            ctx = self.webview.get_context()
+            ctx.set_cache_model(WebKit2.CacheModel.DOCUMENT_VIEWER)
+        except Exception:
+            pass
+        try:
+            self.webview.set_is_muted(True)
+        except Exception:
+            pass
+        # Transparent webview background (lets Hyprland blur show through)
+        try:
+            rgba = Gdk.RGBA(0.0, 0.0, 0.0, 0.0)
+            self.webview.set_background_color(rgba)
+        except Exception:
+            pass
+
+        self._show_placeholder("Start typing…")
+
+        # Swallow transient "cancelled" errors from mid-redirect churn
+        def on_load_failed(_wv: WebKit2.WebView, _event: WebKit2.LoadEvent, _uri: Optional[str], _error: GLib.Error) -> bool:
+            """
+            WebKit load-failed handler that intentionally swallows errors.
+
+            These are frequently benign (e.g., "load cancelled" during rapid
+            navigation/redirects). Returning True tells WebKit we handled it,
+            so the preview doesn't flash an error page.
+            """
+            return True
+
+        self.webview.connect("load-failed", on_load_failed)
+
+        # Open ONLY user-initiated navigations in the system browser.
+        # Allow programmatic `load_uri` navigations to render inside the preview.
+        def on_decide_policy(_webview: WebKit2.WebView,
+                             decision: WebKit2.PolicyDecision,
+                             decision_type: int) -> bool:
+            """
+            Decide-policy hook to route user clicks to the external browser.
+
+            - If navigation was triggered by a user gesture (link click,
+              mouse button), open via xdg-open and ignore the WebKit load.
+            - If it's a programmatic navigation (our preview), allow it.
+            """
+            try:
+                if decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                    nav = decision.get_navigation_action()
+                    req = nav.get_request()
+                    uri = req.get_uri() if req else None
+
+                    is_user = False
+                    try:
+                        if hasattr(nav, "is_user_gesture") and nav.is_user_gesture():
+                            is_user = True
+                    except Exception:
+                        pass
+                    try:
+                        if nav.get_navigation_type() == WebKit2.NavigationType.LINK_CLICKED:
+                            is_user = True
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(nav, "get_mouse_button", lambda: 0)() != 0:
+                            is_user = True
+                    except Exception:
+                        pass
+
+                    if is_user and uri:
+                        os.spawnlp(os.P_NOWAIT, "xdg-open", "xdg-open", uri)
+                        try:
+                            decision.ignore()
+                        except Exception:
+                            pass
+                        return True
+
+                elif decision_type == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
+                    nav = decision.get_navigation_action()
+                    req = nav.get_request()
+                    uri = req.get_uri() if req else None
+                    if uri:
+                        os.spawnlp(os.P_NOWAIT, "xdg-open", "xdg-open", uri)
+                        try:
+                            decision.ignore()
+                        except Exception:
+                            pass
+                        return True
+            except Exception:
+                pass
+            return False
+
+        self.webview.connect("decide-policy", on_decide_policy)
+
+        right_scroller: Gtk.ScrolledWindow = Gtk.ScrolledWindow()
+        right_scroller.add(self.webview)
+        right_wrap.pack_start(right_scroller, True, True, 0)
+
+        # ----- Initial split once; user can drag afterward -----
+        self._initial_position_set: bool = False
+
+        def set_initial_position_once(_w: Gtk.Widget, alloc: Gdk.Rectangle) -> None:
+            """
+            Size-allocate handler used once to establish the initial left/right split.
+
+            We compute the left pane width as (1 - INITIAL_RATIO) of the total
+            width, clamp to a sensible minimum, and set the paned position.
+            After the first call, we do nothing further (so user dragging is respected).
+            """
+            if not self._initial_position_set and alloc.width > 0:
+                left_width = int(alloc.width * (1.0 - INITIAL_RATIO))
+                left_width = max(MIN_LIST_W, left_width)
+                self.paned.set_position(left_width)
+                self._initial_position_set = True
+
+        self.connect("size-allocate", set_initial_position_once)
+
+        # ------------------------- Signals & state -------------------------- #
+        self.entry.connect("changed", self.on_entry_changed)
+        self.entry.connect("key-press-event", self.on_key_press)
+        self.listbox.connect("row-selected", self.on_row_selected)
+        self.listbox.connect("key-press-event", self.on_key_press)
+        self.connect("key-press-event", self.on_key_press)
+
+        self.connect("key-press-event", self.on_window_key)
+        self.connect("destroy", Gtk.main_quit)
+
+        self.last_change: float = 0.0        # timestamp for suggestion debounce
+        self.preview_token: int = 0          # increments to cancel stale previews
+
+        GLib.idle_add(self.entry.grab_focus)
+
+        self._apply_css(left_wrap)
+
+        if initial_query:
+            self.on_entry_changed()
+
+    # ----------------------------- Styling -------------------------------- #
+    def _apply_css(self, left_root: Gtk.Widget) -> None:
+        """
+        Apply CSS styling to the left pane and the paned handle.
+
+        Purpose
+        -------
+        Honor an external CSS file if present (for JaKooLit palette matching).
+        Otherwise, apply a reasonable dark/light fallback style. Also enlarges
+        the GtkPaned handle to make the divider easy to grab.
+
+        Parameters
+        ----------
+        left_root : Gtk.Widget
+            Root widget of the left pane (used as a CSS context anchor).
+
+        Returns
+        -------
+        None
+        """
+        prov = Gtk.CssProvider()
+        loaded = False
+        try:
+            if CSS_PATH_EXPANDED and os.path.isfile(CSS_PATH_EXPANDED):
+                prov.load_from_path(CSS_PATH_EXPANDED)
+                loaded = True
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            dark = is_dark_mode()
+            if dark:
+                css = b"""
+                #left-pane { background: rgba(22,24,28,0.55); border-radius: 14px; }
+                #left-pane entry { background: rgba(40,44,52,0.6); color: #e6edf3; border-radius: 10px; padding: 6px 10px; }
+                .result-row { padding: 10px; }
+                .result-row:selected { background: rgba(120,160,255,0.18); }
+                paned > separator { min-width: 6px; background: rgba(130,150,200,0.25); }
+                """
+            else:
+                css = b"""
+                #left-pane { background: rgba(250,250,252,0.55); border-radius: 14px; }
+                #left-pane entry { background: rgba(255,255,255,0.8); color: #222; border-radius: 10px; padding: 6px 10px; }
+                .result-row { padding: 10px; }
+                .result-row:selected { background: rgba(80,120,255,0.15); }
+                paned > separator { min-width: 6px; background: rgba(80,100,150,0.18); }
+                """
+            prov.load_from_data(css)
+
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    # ------------------------------ UI helpers ---------------------------- #
+    def _show_placeholder(self, text: str) -> None:
+        """
+        Display a neutral placeholder message in the preview pane.
+
+        Purpose
+        -------
+        Keeps the UI visually stable and informative while no preview is being
+        shown or when preview loading is delayed/debounced.
+
+        Parameters
+        ----------
+        text : str
+            Message to render inside the placeholder HTML.
+
+        Returns
+        -------
+        None
+        """
+        self.webview.load_html(placeholder_html(text, is_dark_mode()), "file:///")
+
+    # ------------------------------ Key handlers -------------------------- #
+    def on_window_key(self, _widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
+        """
+        Global key handler for the window (esc to close).
+
+        Returns True if the event is consumed.
+
+        Parameters
+        ----------
+        _widget : Gtk.Widget
+            The widget that received the event (unused).
+        event : Gdk.EventKey
+            The key press event structure.
+
+        Returns
+        -------
+        bool
+            True if handled (Esc), False otherwise.
+        """
+        if Gdk.keyval_name(event.keyval) == "Escape":
+            Gtk.main_quit()
+            return True
+        return False
+
+    def on_key_press(self, _widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
+        """
+        Handle Enter / Ctrl+Enter from the entry, listbox, or window.
+
+        Behavior
+        --------
+        - Enter: open current query in the default browser and close the app.
+        - Ctrl+Enter: open current query but keep the app open for continued preview.
+
+        Parameters
+        ----------
+        _widget : Gtk.Widget
+            Source widget (entry, listbox, or window). Unused for logic.
+        event : Gdk.EventKey
+            The key event containing keyval and modifier state.
+
+        Returns
+        -------
+        bool
+            True if the key was processed, False otherwise.
+        """
+        key = Gdk.keyval_name(event.keyval)
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+
+        if key in ("KP_Enter", "Return"):
+            row = self.listbox.get_selected_row()
+            q = row.get_child().get_text() if row else self.entry.get_text().strip()
+            if not q:
+                return True
+
+            # Ctrl+Enter => open but do NOT close
+            if ctrl:
+                os.spawnlp(os.P_NOWAIT, "xdg-open", "xdg-open", search_url(OPEN_ENGINE, q))
+                return True
+
+            # Enter => open and close
+            os.spawnlp(os.P_NOWAIT, "xdg-open", "xdg-open", search_url(OPEN_ENGINE, q))
+            Gtk.main_quit()
+            return True
+
+        return False
+
+    # ----------------------------- Suggestions ---------------------------- #
+    def on_entry_changed(self, *_: Any) -> None:
+        """
+        Entry change handler: debounce, then fetch suggestions and repopulate.
+
+        Methodology
+        -----------
+        - Record a timestamp `self.last_change`.
+        - Spawn a daemon thread that sleeps for DEBOUNCE_MS and then checks
+          if another change occurred (by comparing timestamps).
+        - If fresh, call `suggestions()` and update the list via GLib.idle_add,
+          which safely marshals back to the GTK main thread.
+
+        Parameters
+        ----------
+        *_ : Any
+            Unused positional args required by the GTK signal signature.
+
+        Returns
+        -------
+        None
+        """
+        self.last_change = time.time()
+        text = self.entry.get_text()
+
+        def worker(since: float, query: str) -> None:
+            time.sleep(DEBOUNCE_MS / 1000.0)
+            if since < self.last_change:
+                return
+            data = suggestions(query)
+            GLib.idle_add(self.populate, data, query)
+
+        threading.Thread(target=worker, args=(self.last_change, text), daemon=True).start()
+
+    def populate(self, items: List[str], q: str) -> None:
+        """
+        Populate the suggestions list and queue a preview for the first item.
+
+        Methodology
+        -----------
+        - Clear any existing rows.
+        - Optionally include the raw query as the first item for quick "search as typed".
+        - Create up to 50 rows (wrapping labels for long suggestions).
+        - Auto-select the first row and queue a preview load.
+
+        Parameters
+        ----------
+        items : List[str]
+            Suggestion candidates.
+        q : str
+            Current raw query string from the entry.
+
+        Returns
+        -------
+        None
+        """
+        for row in list(self.listbox.get_children()):
+            self.listbox.remove(row)
+
+        if q.strip() and (not items or items[0] != q):
+            items = [q] + [it for it in items if it != q]
+
+        for s in items[:50]:
+            lbl = Gtk.Label(label=s, xalign=0)
+            lbl.set_line_wrap(True)
+            row = Gtk.ListBoxRow()
+            row.add(lbl)
+            row.get_style_context().add_class("result-row")
+            self.listbox.add(row)
+
+        self.listbox.show_all()
+
+        first = self.listbox.get_row_at_index(0)
+        if first:
+            self.listbox.select_row(first)
+            self.queue_preview(first)
+
+    def on_row_selected(self, _listbox: Gtk.ListBox, row: Optional[Gtk.ListBoxRow]) -> None:
+        """
+        Selection-change handler: queue a (debounced) preview for the current row.
+
+        Parameters
+        ----------
+        _listbox : Gtk.ListBox
+            The listbox emitting the signal (unused).
+        row : Optional[Gtk.ListBoxRow]
+            The newly selected row, or None if selection cleared.
+
+        Returns
+        -------
+        None
+        """
+        if row:
+            self.queue_preview(row)
+
+    # ------------------------------- Preview ------------------------------- #
+    def queue_preview(self, row: Gtk.ListBoxRow) -> None:
+        """
+        Debounce and initiate a preview load for the given row's text.
+
+        Methodology
+        -----------
+        - Increment a `preview_token` so older timers become stale.
+        - After PREVIEW_DELAY_MS, if the token is still current, stop any
+          in-flight load and call `self.webview.load_uri()` with the built URL.
+
+        Parameters
+        ----------
+        row : Gtk.ListBoxRow
+            The currently selected suggestion row.
+
+        Returns
+        -------
+        None
+        """
+        self.preview_token += 1
+        token = self.preview_token
+        q_text = row.get_child().get_text() if row else ""
+        if not q_text:
+            return
+        url = search_url(PREVIEW_ENGINE, q_text)
+
+        def later() -> bool:
+            if token != self.preview_token:
+                return False  # stale — another row was selected since
+            try:
+                try:
+                    self.webview.stop_loading()
+                except Exception:
+                    pass
+                self.webview.load_uri(url)
+            except Exception:
+                self._show_placeholder("Preview busy…")
+            return False  # one-shot
+
+        GLib.timeout_add(PREVIEW_DELAY_MS, later)
+
+    # ------------------------- Ratio persistence --------------------------- #
+    def _on_paned_button_release(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        """
+        Save the preview/list ratio when the user finishes dragging the divider.
+
+        Purpose
+        -------
+        Provides a persistent, user-defined split so subsequent launches
+        restore the same ergonomics.
+
+        Methodology
+        -----------
+        - Only respond to primary-button releases (button == 1).
+        - Compute total window width; read the current paned position (left width).
+        - Convert to a preview share ratio, clamp to [0.1, 0.9], round, and
+          persist via `save_config_value("preview_ratio", ...)`.
+
+        Parameters
+        ----------
+        widget : Gtk.Widget
+            The paned widget emitting the event (unused).
+        event : Gdk.EventButton
+            The button event; we use `event.button` to gate on primary release.
+
+        Returns
+        -------
+        bool
+            False to propagate the event further; True would stop propagation.
+        """
+        if getattr(event, "button", 0) != 1:
+            return False
+        alloc = self.get_allocation()
+        total_w = alloc.width if alloc else 0
+        if total_w <= 0:
+            return False
+        left_w = max(MIN_LIST_W, self.paned.get_position())
+        ratio = 1.0 - (left_w / float(total_w))  # preview share (right side)
+        ratio = max(0.1, min(0.9, ratio))
+        save_config_value("preview_ratio", round(ratio, 4))
+        return False
+
+
+# --------------------------------- Main ------------------------------------ #
+def main() -> None:
+    """
+    Program entry point.
+
+    Behavior
+    --------
+    - Accepts an optional initial query from command-line arguments (e.g., when
+      launched from Anyrun with a pre-filled string).
+    - Instantiates the `App` window, shows it, and hands off to the GTK main loop.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+    """
+    initial_query = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else ""
+    app = App(initial_query=initial_query)
+    app.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+
