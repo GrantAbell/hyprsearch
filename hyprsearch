@@ -39,7 +39,7 @@ CFG: Dict[str, Any] = {
     "width": 1200,
     "height": 720,
     "opacity": 0.92,
-    "title": "Search Preview",
+    "title": "hyprsearch",
     "start_centered": True,
     "enable_blur_hint": True,
     "preview_ratio": 0.60,        # initial ratio (right preview share); updated on drag
@@ -47,7 +47,7 @@ CFG: Dict[str, Any] = {
     "min_list_width": 280         # prevents left pane cropping
 }
 
-CONFIG_PATH: str = os.path.expanduser("~/.config/search-preview/config.json")
+CONFIG_PATH: str = os.path.expanduser("~/.config/hyprsearch/config.json")
 
 
 # ------------------------------- Config IO --------------------------------- #
